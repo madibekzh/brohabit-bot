@@ -1,10 +1,12 @@
 import asyncio
 import logging
+import os
 import sys
 from aiogram import Bot, Dispatcher
-from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
 
 from config import BOT_TOKEN
 from database.db import init_db
@@ -17,31 +19,13 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-import os
-from aiohttp import web
-
 logger = logging.getLogger(__name__)
 
-async def health_check_handler(request):
-    return web.Response(text="BroHabit Bot is running 24/7! 🚀", content_type="text/plain")
+WEBHOOK_PATH = "/webhook"
 
-async def run_health_server():
-    """Бұлтты хостингтерде (Render/Railway) 24/7 өшпей тұру үшін веб-сервер"""
-    port_str = os.getenv("PORT")
-    if not port_str:
-        return
-    try:
-        port = int(port_str)
-        app = web.Application()
-        app.router.add_get("/", health_check_handler)
-        app.router.add_get("/health", health_check_handler)
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", port)
-        await site.start()
-        logger.info(f"🌐 24/7 Health-check сервері {port} портында қосылды.")
-    except Exception as e:
-        logger.warning(f"Health-check серверін қосу қатесі: {e}")
+async def health_check_handler(request):
+    """24/7 тексеруге арналған веб-бет (UptimeRobot және браузер үшін)"""
+    return web.Response(text="BroHabit Bot is running 24/7! 🚀", content_type="text/plain")
 
 async def set_default_commands(bot: Bot):
     """Телеграмдағы мәзір командаларын орнату"""
@@ -57,59 +41,102 @@ async def set_default_commands(bot: Bot):
     ]
     await bot.set_my_commands(commands)
 
-async def main():
-    if not BOT_TOKEN or BOT_TOKEN == "your_telegram_bot_token_here":
-        logger.error(
-            "\n" + "="*60 + "\n"
-            "❌ ҚАТЕ: Бот токені табылмады!\n"
-            ".env файлына BOT_TOKEN мәнін енгізіңіз.\n"
-            "Токенді Telegram-дағы @BotFather арқылы алуға болады.\n"
-            + "="*60
-        )
-        sys.exit(1)
-
-    # Деректер қорын дайындау
-    logger.info("Мәліметтер қоры іске қосылуда...")
-    await init_db()
-
-    # Бот және диспетчерді жасау
-    bot = Bot(token=BOT_TOKEN)
+def create_dispatcher() -> Dispatcher:
     dp = Dispatcher(storage=MemoryStorage())
-
-    # Маршрутизаторларды (роутерлерді) тіркеу
     dp.include_router(start.router)
     dp.include_router(workout_plan.router)
     dp.include_router(habit_manager.router)
     dp.include_router(checkin.router)
     dp.include_router(stats.router)
     dp.include_router(settings.router)
+    return dp
 
-    # Жоспарлағышты (еске салу жүйесін) іске қосу
+# ==================== WEBHOOK РЕЖИМІ (RENDER.COM ҮШІН) ====================
+
+async def on_webhook_startup(bot: Bot, base_url: str):
+    logger.info("Мәліметтер қоры іске қосылуда...")
+    await init_db()
+
     scheduler = setup_scheduler(bot)
     scheduler.start()
     logger.info("Еске салу жүйесі (Scheduler) сәтті іске қосылды.")
 
-    # Бот командаларын орнату
     try:
         await set_default_commands(bot)
     except Exception as e:
         logger.warning(f"Командаларды орнату кезінде ескерту: {e}")
 
-    logger.info("🚀 Бот сәтті іске қосылды және хабарламаларды күтуде...")
+    webhook_url = f"{base_url}{WEBHOOK_PATH}"
+    logger.info(f"Telegram Webhook орнатылуда: {webhook_url}")
+    await bot.set_webhook(webhook_url, drop_pending_updates=True)
+    logger.info("🚀 Бот WEBHOOK режимінде 24/7 сәтті іске қосылды!")
 
-    # Бұлтты серверлерге арналған 24/7 health-check
-    await run_health_server()
+async def on_webhook_shutdown(bot: Bot):
+    logger.info("Бот тоқтатылуда...")
+    await bot.session.close()
+
+def run_webhook_server(bot: Bot, dp: Dispatcher, base_url: str, port: int):
+    """Render сияқты бұлтты платформаларда Webhook серверін қосу"""
+    app = web.Application()
+    app.router.add_get("/", health_check_handler)
+    app.router.add_get("/health", health_check_handler)
+
+    dp.startup.register(lambda: on_webhook_startup(bot, base_url))
+    dp.shutdown.register(lambda: on_webhook_shutdown(bot))
+
+    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
+    setup_application(app, dp, bot=bot)
+
+    logger.info(f"🌐 Webhook веб-сервері {port} портында қосылуда...")
+    web.run_app(app, host="0.0.0.0", port=port)
+
+# ==================== POLLING РЕЖИМІ (ЛОКАЛДЫ КОМПЬЮТЕР ҮШІН) ====================
+
+async def run_polling(bot: Bot, dp: Dispatcher):
+    logger.info("Мәліметтер қоры іске қосылуда...")
+    await init_db()
+
+    scheduler = setup_scheduler(bot)
+    scheduler.start()
+    logger.info("Еске салу жүйесі (Scheduler) сәтті іске қосылды.")
 
     try:
-        # Ескі оқылмаған хабарламаларды тазартып, жаңаларын тыңдау
+        await set_default_commands(bot)
+    except Exception as e:
+        logger.warning(f"Командаларды орнату кезінде ескерту: {e}")
+
+    logger.info("🚀 Бот POLLING режимінде іске қосылды...")
+    try:
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
     finally:
         scheduler.shutdown()
         await bot.session.close()
 
+# ==================== НЕГІЗГІ НҮКТЕ ====================
+
+def main():
+    if not BOT_TOKEN or BOT_TOKEN == "your_telegram_bot_token_here":
+        logger.error("❌ ҚАТЕ: Бот токені табылмады!")
+        sys.exit(1)
+
+    bot = Bot(token=BOT_TOKEN)
+    dp = create_dispatcher()
+
+    # Render немесе сыртқы бұлтта жүргенін тексеру
+    render_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("WEBHOOK_URL")
+    port_str = os.getenv("PORT")
+
+    if render_url or port_str:
+        base_url = render_url or f"https://brohabit-bot.onrender.com"
+        port = int(port_str or 8080)
+        run_webhook_server(bot, dp, base_url, port)
+    else:
+        # Локалды компьютерде Polling арқылы іске қосу
+        asyncio.run(run_polling(bot, dp))
+
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        main()
     except (KeyboardInterrupt, SystemExit):
         logger.info("Бот жұмысын аяқтады.")
